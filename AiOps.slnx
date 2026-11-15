@@ -1,0 +1,10 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/AiOps.Contracts/AiOps.Contracts.csproj" />
+    <Project Path="src/AiOps.Mcp/AiOps.Mcp.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/AiOps.Mcp.LabTests/AiOps.Mcp.LabTests.csproj" />
+    <Project Path="tests/AiOps.Mcp.Tests/AiOps.Mcp.Tests.csproj" />
+  </Folder>
+</Solution>

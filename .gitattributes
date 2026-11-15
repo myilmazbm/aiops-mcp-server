@@ -1,0 +1,10 @@
+# Line endings are pinned to LF on every platform. This is not cosmetic:
+# deploy/sccm/Detect-AIOpsReader.ps1 embeds the SHA256 of deploy/jea/AIOpsReader.psrc, and a
+# checkout that rewrote LF to CRLF (Git for Windows does by default) would change that hash,
+# fail the unit test that pins it, and make the SCCM baseline report every server as
+# non-compliant. Windows PowerShell 5.1 reads LF scripts without issue.
+* text=auto eol=lf
+
+*.zip binary
+*.dll binary
+*.exe binary

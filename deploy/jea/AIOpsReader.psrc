@@ -1,0 +1,189 @@
+# AIOpsReader role capability — the single security boundary of the AIOps system.
+# Only strictly read-only cmdlets are visible. Never add Set-*/New-*/Remove-*,
+# Invoke-Expression, Start-Process or anything that can mutate state.
+# Must remain Windows PowerShell 5.1 compatible.
+#
+# Every entry carries an explicit parameter allow-list. A bare cmdlet name in JEA permits
+# EVERY parameter of that cmdlet, which is how a read-only role ended up granting:
+#   * arbitrary registry reads (-Path), e.g. the Winlogon autologon password, service
+#     ImagePath values with embedded credentials, SNMP community strings — all readable
+#     because the JEA virtual account is a local administrator;
+#   * raw Security event log dumps (-LogName), bypassing the FilterXml discipline and the
+#     message truncation the MCP layer applies;
+#   * execution against a different host (-ComputerName / -CimSession), which would reach
+#     past the server the caller named — including domain controllers, out of scope by policy.
+# All three were reproduced against a lab server through run_readonly before this was written.
+@{
+    GUID              = 'f6a2c7e1-3b8d-4c5a-9e0f-1d2a3b4c5d6e'
+    Author            = 'AIOps'
+    Description       = 'Read-only diagnostics role for the AIOps MCP server.'
+    CompanyName       = 'AIOps'
+
+    # Parameter-restricted entries make JEA generate a proxy function, which it can only do
+    # when the defining module is present in the session. The three modules below are not
+    # loaded by a RestrictedRemoteServer session by default, so without this their entries
+    # silently produce no visible command at all. (That is why the Get-CimInstance allow-list
+    # never took effect before: it was already in the restricted form.) Importing a module
+    # does not expose it — VisibleCmdlets still decides what the caller can see.
+    ModulesToImport   = @(
+        'NetTCPIP'
+        'ScheduledTasks'
+        'CimCmdlets'
+    )
+
+    VisibleCmdlets    = @(
+        # Events: FilterXml only. -LogName is deliberately absent so the filter always runs
+        # on the target (the performance rule) and the Security log cannot be bulk-read.
+        # Ad-hoc callers can still reach any channel by writing the FilterXml themselves.
+        @{
+            Name       = 'Microsoft.PowerShell.Diagnostics\Get-WinEvent'
+            Parameters = @(
+                @{ Name = 'FilterXml' }
+                @{ Name = 'MaxEvents' }
+            )
+        }
+
+        # Performance counters. -ComputerName withheld: the target is the session, never a
+        # parameter.
+        @{
+            Name       = 'Microsoft.PowerShell.Diagnostics\Get-Counter'
+            Parameters = @(
+                @{ Name = 'Counter' }
+                @{ Name = 'MaxSamples' }
+                @{ Name = 'SampleInterval' }
+            )
+        }
+
+        # Services, processes, hotfixes. Each is invoked with no parameters by the typed
+        # tools; the filters below exist for ad-hoc diagnosis. -ComputerName is withheld
+        # from all three.
+        @{
+            Name       = 'Microsoft.PowerShell.Management\Get-Service'
+            Parameters = @(
+                @{ Name = 'Name' }
+                @{ Name = 'DisplayName' }
+                @{ Name = 'Include' }
+                @{ Name = 'Exclude' }
+            )
+        }
+        @{
+            Name       = 'Microsoft.PowerShell.Management\Get-Process'
+            Parameters = @(
+                @{ Name = 'Name' }
+                @{ Name = 'Id' }
+            )
+        }
+        @{
+            Name       = 'Microsoft.PowerShell.Management\Get-HotFix'
+            Parameters = @(
+                @{ Name = 'Id' }
+                @{ Name = 'Description' }
+            )
+        }
+
+        # Registry and certificate reads, restricted to the four keys the collector needs
+        # plus the machine store. Widening this pattern is a security decision: the registry
+        # is where credentials live on a Windows server, and the virtual account can read all
+        # of it. The pattern validates each element, so the two Uninstall paths that arrive
+        # as one array both have to match.
+        #   HKLM:\SOFTWARE\[WOW6432Node\]Microsoft\Windows\CurrentVersion\Uninstall\*
+        #   HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Group Policy\History\*\*
+        #   HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Perflib\CurrentLanguage
+        #   Cert:\LocalMachine\My
+        @{
+            Name       = 'Microsoft.PowerShell.Management\Get-Item'
+            Parameters = @(
+                @{ Name = 'Path'; ValidatePattern = '^(HKLM:\\SOFTWARE\\(WOW6432Node\\)?Microsoft\\Windows\\CurrentVersion\\Uninstall(\\[^\\]+)?|HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Group Policy\\History(\\[^\\]+){0,2}|HKLM:\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Perflib\\CurrentLanguage|Cert:\\LocalMachine\\My(\\[^\\]+)?)$' }
+            )
+        }
+        @{
+            Name       = 'Microsoft.PowerShell.Management\Get-ItemProperty'
+            Parameters = @(
+                @{ Name = 'Path'; ValidatePattern = '^(HKLM:\\SOFTWARE\\(WOW6432Node\\)?Microsoft\\Windows\\CurrentVersion\\Uninstall(\\[^\\]+)?|HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Group Policy\\History(\\[^\\]+){0,2}|HKLM:\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Perflib\\CurrentLanguage|Cert:\\LocalMachine\\My(\\[^\\]+)?)$' }
+                @{ Name = 'Name' }
+            )
+        }
+        @{
+            Name       = 'Microsoft.PowerShell.Management\Get-ChildItem'
+            Parameters = @(
+                @{ Name = 'Path'; ValidatePattern = '^(HKLM:\\SOFTWARE\\(WOW6432Node\\)?Microsoft\\Windows\\CurrentVersion\\Uninstall(\\[^\\]+)?|HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Group Policy\\History(\\[^\\]+){0,2}|HKLM:\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Perflib\\CurrentLanguage|Cert:\\LocalMachine\\My(\\[^\\]+)?)$' }
+            )
+        }
+
+        # Listening ports (never parse netstat). -CimSession withheld.
+        @{
+            Name       = 'NetTCPIP\Get-NetTCPConnection'
+            Parameters = @(
+                @{ Name = 'State' }
+                @{ Name = 'LocalPort' }
+                @{ Name = 'RemotePort' }
+                @{ Name = 'LocalAddress' }
+                @{ Name = 'RemoteAddress' }
+                @{ Name = 'OwningProcess' }
+            )
+        }
+
+        # Scheduled tasks. -CimSession withheld.
+        @{
+            Name       = 'ScheduledTasks\Get-ScheduledTask'
+            Parameters = @(
+                @{ Name = 'TaskName' }
+                @{ Name = 'TaskPath' }
+            )
+        }
+        @{
+            Name       = 'ScheduledTasks\Get-ScheduledTaskInfo'
+            Parameters = @(
+                @{ Name = 'TaskName' }
+                @{ Name = 'TaskPath' }
+            )
+        }
+
+        # Projection only: -ExpandProperty flattens nested outputs (e.g. Get-Counter
+        # samples) that PSRP would truncate at serialization depth 1. The full cmdlet is
+        # NOT exposed: -Property stays restricted so calculated-property script blocks
+        # cannot be smuggled in. (Approved addition, 2026-07-07.)
+        @{
+            Name       = 'Microsoft.PowerShell.Utility\Select-Object'
+            Parameters = @(
+                @{ Name = 'InputObject' }   # pipeline binding; hidden parameters break piping
+                @{ Name = 'ExpandProperty' }
+                @{ Name = 'First' }
+                @{ Name = 'Last' }
+            )
+        }
+
+        # CIM inventory, restricted to an explicit class allow-list.
+        # Win32_Product is intentionally absent (querying it triggers MSI reconfigure).
+        # -CimSession and -Query are absent: the first redirects to another host, the second
+        # bypasses the ClassName allow-list entirely.
+        @{
+            Name       = 'CimCmdlets\Get-CimInstance'
+            Parameters = @(
+                @{
+                    Name        = 'ClassName'
+                    ValidateSet = @(
+                        'Win32_OperatingSystem'
+                        'Win32_ComputerSystem'
+                        'Win32_ComputerSystemProduct'
+                        'Win32_BIOS'
+                        'Win32_Processor'
+                        'Win32_LogicalDisk'
+                        'Win32_Volume'
+                        'Win32_NetworkAdapterConfiguration'
+                        'Win32_QuickFixEngineering'
+                        'Win32_PageFileUsage'
+                    )
+                }
+                @{ Name = 'Filter' }
+                @{ Name = 'Property' }
+                @{ Name = 'Namespace'; ValidateSet = @('root/cimv2') }
+            )
+        }
+    )
+
+    VisibleProviders  = @(
+        'Registry'
+        'Certificate'
+    )
+}

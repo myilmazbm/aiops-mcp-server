@@ -1,0 +1,33 @@
+# AIOpsScomReader session configuration — registered ONLY on the SCOM management server.
+# __AIOPS_PRINCIPAL__ is replaced by Register-AIOpsScomReader.ps1 with the gMSA.
+#
+# RunAsVirtualAccount is deliberately $false: SCOM authorizes by the caller's SCOM user
+# role, and a virtual account holds none. The session runs as the connecting identity
+# (the gMSA), which must be a member of the SCOM "Read-Only Operators" role.
+@{
+    SchemaVersion        = '2.0.0.0'
+    GUID                 = 'b8d1e2f3-4a5b-4c6d-8e9f-0a1b2c3d4e5f'
+    Author               = 'AIOps'
+    Description          = 'Read-only SCOM SDK JEA endpoint for the AIOps MCP server.'
+
+    # SessionType = Default, NOT RestrictedRemoteServer: the restricted type installs proxy
+    # FUNCTIONS (e.g. a Select-Object without -ExpandProperty) that shadow the real cmdlets
+    # for ALL code in the session, breaking the OperationsManager module's internals. Default
+    # avoids those proxies. The caller is still locked to the two wrapper functions by JEA's
+    # RoleDefinitions + VisibleFunctions allowlist below (verified: no other command runs),
+    # and LanguageMode = NoLanguage blocks scripts/variables.
+    SessionType          = 'Default'
+    LanguageMode         = 'NoLanguage'
+    # RemoteSigned: the wrappers import the Microsoft-signed OperationsManager.psm1.
+    ExecutionPolicy      = 'RemoteSigned'
+
+    RunAsVirtualAccount  = $false
+
+    TranscriptDirectory  = 'C:\ProgramData\AIOps\Transcripts'
+
+    RoleDefinitions      = @{
+        '__AIOPS_PRINCIPAL__' = @{
+            RoleCapabilities = 'AIOpsScomReader'
+        }
+    }
+}

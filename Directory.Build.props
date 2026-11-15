@@ -1,0 +1,33 @@
+<Project>
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <InvariantGlobalization>false</InvariantGlobalization>
+  </PropertyGroup>
+
+  <!--
+    Security pins for transitive packages. NuGet audit findings are errors in this repo
+    (NU1902/NU1903 under TreatWarningsAsErrors), so a vulnerable transitive version is
+    lifted here, in one place, instead of being suppressed. Raise the version when a new
+    advisory lands and delete a pin once the packages that pull it in ship a fixed version.
+  -->
+  <PropertyGroup>
+    <SystemSecurityCryptographyPinVersion>10.0.15</SystemSecurityCryptographyPinVersion>
+  </PropertyGroup>
+
+  <!-- Pkcs reaches AiOps.Mcp (and therefore the test projects) through its package graph. -->
+  <ItemGroup Condition="'$(MSBuildProjectName)' != 'AiOps.Contracts'">
+    <PackageReference Include="System.Security.Cryptography.Pkcs" Version="$(SystemSecurityCryptographyPinVersion)" />
+  </ItemGroup>
+
+  <!--
+    Xml is only resolved as a package in the test projects. AiOps.Mcp uses the Web SDK,
+    where the ASP.NET Core shared framework supplies it and the package is pruned, so a
+    reference there would be redundant (NU1510).
+  -->
+  <ItemGroup Condition="$(MSBuildProjectName.EndsWith('Tests'))">
+    <PackageReference Include="System.Security.Cryptography.Xml" Version="$(SystemSecurityCryptographyPinVersion)" />
+  </ItemGroup>
+</Project>

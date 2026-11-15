@@ -1,0 +1,496 @@
+# AIOpsScomReader role capability — read-only access to the SCOM SDK on the management
+# server, exposed through trusted wrapper FUNCTIONS rather than the raw cmdlets.
+#
+# Why functions, not VisibleCmdlets: the OperationsManager module's own cmdlets pipe to
+# Select-Object internally, which a RestrictedRemoteServer proxy shadows and breaks. The
+# documented JEA pattern for wrapping such a module is a FunctionDefinition that runs in
+# Full Language mode (even though the session is NoLanguage) and returns flat objects.
+#
+# Security: the caller can invoke ONLY these functions, only with the parameters their param
+# blocks declare. Every one is strictly read-only (Get-SCOM* + shaping); nothing resolves,
+# closes or modifies alerts, maintenance mode, overrides or management packs.
+# Windows PowerShell 5.1 only — the OperationsManager module is 5.1.
+#
+# Shared serialization rule: PSRP serializes nested objects only to depth 1, so every
+# multi-valued field is emitted as a FLAT STRING ARRAY ("key=value" or "a|b|c"), which the
+# MCP layer parses back into typed DTOs.
+@{
+    GUID              = '2f7c9d84-6b1e-4a3f-9c5d-7e8f0a1b2c3d'
+    Author            = 'AIOps'
+    Description       = 'Read-only SCOM SDK role for the AIOps MCP server.'
+    CompanyName       = 'AIOps'
+
+    # NOTE: OperationsManager is NOT imported via ModulesToImport. Its import-time code uses
+    # Select-Object -ExpandProperty, which the restricted InitialSessionState cannot provide,
+    # so a session-level import fails outright. Instead each wrapper imports it itself: the
+    # functions run in Full Language mode, where the module loads normally. Import is cached
+    # in the pooled runspace, so only the first call per session pays for it.
+
+    VisibleFunctions  = 'Get-AIOpsScomAlerts', 'Get-AIOpsScomHealth', 'Get-AIOpsScomPerformance',
+                        'Get-AIOpsScomInventory', 'Get-AIOpsScomAlertDetail', 'Get-AIOpsScomStateChanges',
+                        'Get-AIOpsScomMonitoringHealth'
+
+    FunctionDefinitions = @(
+        @{
+            Name        = 'Get-AIOpsScomAlerts'
+            ScriptBlock = {
+                param(
+                    [ValidateSet('Error', 'Warning', 'Information')] [string] $Severity,
+                    [ValidateRange(0, 255)] [int] $ResolutionState = -1,
+                    [string] $ObjectName,
+                    [ValidateRange(1, 1000)] [int] $MaxCount = 200
+                )
+                if (-not (Get-Module OperationsManager)) { Import-Module OperationsManager -ErrorAction Stop }
+                $q = @{}
+                if ($Severity)             { $q['Severity'] = $Severity }
+                if ($ResolutionState -ge 0){ $q['ResolutionState'] = [byte]$ResolutionState }
+                if ($ObjectName)           { $q['Criteria'] = "MonitoringObjectDisplayName LIKE '%$($ObjectName.Replace("'","''"))%'" }
+                Get-SCOMAlert @q |
+                    Sort-Object TimeRaised -Descending |
+                    Select-Object -First $MaxCount |
+                    ForEach-Object {
+                        [pscustomobject]@{
+                            Id                          = $_.Id.ToString()
+                            Name                        = $_.Name
+                            Description                 = $_.Description
+                            Severity                    = "$($_.Severity)"
+                            Priority                    = "$($_.Priority)"
+                            ResolutionState             = [int]$_.ResolutionState
+                            MonitoringObjectDisplayName = $_.MonitoringObjectDisplayName
+                            MonitoringObjectPath        = $_.MonitoringObjectPath
+                            TimeRaised                  = $_.TimeRaised
+                            LastModified                = $_.LastModified
+                            RepeatCount                 = [int]$_.RepeatCount
+                        }
+                    }
+            }
+        }
+        @{
+            # Historical counter data SCOM already collected. Aggregation happens here so the
+            # caller gets min/avg/max/last instead of thousands of raw samples.
+            Name        = 'Get-AIOpsScomPerformance'
+            ScriptBlock = {
+                param(
+                    [Parameter(Mandatory)] [string] $ObjectName,
+                    [string] $Counter,
+                    [ValidateRange(1, 720)] [int] $Hours = 24,
+                    [ValidateRange(1, 500)] [int] $MaxSeries = 100,
+                    [switch] $IncludeSamples,
+                    [ValidateRange(1, 500)] [int] $MaxSamples = 200
+                )
+                if (-not (Get-Module OperationsManager)) { Import-Module OperationsManager -ErrorAction Stop }
+                $to = [datetime]::UtcNow
+                $from = $to.AddHours(-$Hours)
+                $objs = @(Get-SCOMMonitoringObject | Where-Object { $_.DisplayName -like $ObjectName -or $_.Path -like $ObjectName })
+                $emitted = 0
+                foreach ($o in $objs) {
+                    foreach ($p in $o.GetMonitoringPerformanceData()) {
+                        if ($emitted -ge $MaxSeries) { return }
+                        $full = "$($p.ObjectName)\$($p.CounterName)"
+                        if ($Counter -and $full -notlike "*$Counter*") { continue }
+                        $v = @($p.GetValues($from, $to))
+                        if ($v.Count -eq 0) { continue }
+                        $emitted++
+                        $st = $v | Measure-Object SampleValue -Average -Minimum -Maximum
+                        $last = $v | Select-Object -Last 1
+                        $row = [ordered]@{
+                            Server           = $(if ($o.Path) { $o.Path } else { $o.DisplayName })
+                            MonitoringObject = $o.DisplayName
+                            Counter          = $full
+                            Instance         = $p.InstanceName
+                            SampleCount      = [int]$v.Count
+                            Min              = [double]$st.Minimum
+                            Avg              = [double]$st.Average
+                            Max              = [double]$st.Maximum
+                            Last             = [double]$last.SampleValue
+                            LastSampledUtc   = $last.TimeSampled
+                        }
+                        if ($IncludeSamples) {
+                            $row['Samples'] = @($v | Select-Object -Last $MaxSamples |
+                                ForEach-Object { "$([datetime]::SpecifyKind($_.TimeSampled,'Utc').ToString('o'))=$($_.SampleValue)" })
+                        }
+                        [pscustomobject]$row
+                    }
+                }
+            }
+        }
+        @{
+            # What SCOM discovered about a computer without logging into it — the only
+            # inventory source for hosts outside the fleet JEA scope (domain controllers).
+            Name        = 'Get-AIOpsScomInventory'
+            ScriptBlock = {
+                param(
+                    [Parameter(Mandatory)] [string] $ComputerName,
+                    [ValidateRange(1, 200)] [int] $MaxComputers = 50
+                )
+                if (-not (Get-Module OperationsManager)) { Import-Module OperationsManager -ErrorAction Stop }
+
+                # Local helper: read a monitored object's discovered properties into a
+                # hashtable, optionally prefixed so several classes can share one bag.
+                # Function-scoped on purpose, NOT script: — a script-scoped function outlives the
+                # call in a pooled session, and because JEA stamps command visibility when the
+                # session is built, anything created later is outside the VisibleFunctions
+                # allow-list for every subsequent call on that session.
+                function Get-PropMap($obj, $prefix) {
+                    $t = @{}
+                    if (-not $obj) { return $t }
+                    # A .NET method exception is terminating in PS 5.1, so one orphaned instance
+                    # or a property whose management pack has been deleted used to abort the
+                    # whole function — the tool then returned the computers gathered so far
+                    # labelled 'error', a partial answer the LLM cannot tell from a failure.
+                    try { $properties = @($obj.GetMonitoringProperties()) } catch { return $t }
+                    foreach ($p in $properties) {
+                        try { $val = $obj.GetMonitoringPropertyValue($p) } catch { continue }
+                        if ($null -ne $val -and "$val" -ne '') { $t["$prefix$($p.Name)"] = "$val" }
+                    }
+                    $t
+                }
+
+                # Sort BEFORE the cap. Taking the first N in raw SDK order and sorting afterwards
+                # returns an arbitrary slice that looks like an alphabetical head, so asking
+                # "is SRV499 monitored?" gets a tidy A-to-Z list ending early and the answer 'no'.
+                $comp = @(Get-SCOMClassInstance -Class (Get-SCOMClass -Name 'Microsoft.Windows.Computer') |
+                    Where-Object { $_.DisplayName -like $ComputerName } |
+                    Sort-Object DisplayName |
+                    Select-Object -First $MaxComputers)
+                if ($comp.Count -eq 0) { return }
+
+                # Join the related classes once, indexed by owning computer. NOTE: nested
+                # objects carry paths like 'HOST;SUBOBJECT', so key on the first path segment
+                # or SYSVOL/DNS style children are silently missed.
+                # The class name carries the OS generation (Server.10.0 = 2016/2019/2022/2025,
+                # Server.6.2 = 2012 R2, and the AD role class is versioned too). Pinning one
+                # literal name made an older host return status 'ok' with empty Disks and
+                # NetworkAdapters — indistinguishable from a genuine discovery failure, and on a
+                # domain controller it silently dropped the FSMO data this tool exists for.
+                # Patterns cover every generation present in the management group; all matching
+                # classes are merged.
+                $byPath = {
+                    param($classPattern)
+                    $t = @{}
+                    foreach ($cl in @(Get-SCOMClass -Name $classPattern -ErrorAction SilentlyContinue)) {
+                        foreach ($i in @(Get-SCOMClassInstance -Class $cl -ErrorAction SilentlyContinue)) {
+                            $key = ($i.Path -split ';')[0]
+                            if (-not $key) { $key = $i.DisplayName }
+                            if (-not $t.ContainsKey($key)) { $t[$key] = @() }
+                            $t[$key] += $i
+                        }
+                    }
+                    $t
+                }
+                $osByHost   = & $byPath 'Microsoft.Windows.OperatingSystem'
+                $diskByHost = & $byPath 'Microsoft.Windows.Server.*.LogicalDisk'
+                $nicByHost  = & $byPath 'Microsoft.Windows.Server.*.NetworkAdapter'
+                $dcByHost   = & $byPath 'Microsoft.Windows.Server.*.AD.DomainControllerRole'
+
+                foreach ($c in $comp) {
+                    $host_ = $c.DisplayName
+                    # Prefixes keep the three sources collision-free in one bag:
+                    # (none) = computer, 'OS.' = version/build/RAM/serial, 'AD.' = all five
+                    # FSMO holders + GC/RODC flags (domain controllers only — the hosts our
+                    # fleet JEA cannot reach).
+                    $props = (Get-PropMap $c '') +
+                             (Get-PropMap @($osByHost[$host_])[0] 'OS.') +
+                             (Get-PropMap @($dcByHost[$host_])[0] 'AD.')
+
+                    $disks = @(foreach ($d in @($diskByHost[$host_])) {
+                        if (-not $d) { continue }
+                        $dp = Get-PropMap $d ''
+                        (($d.DisplayName, $dp['FileSystem'], $dp['SizeInMBs'], "$($d.HealthState)") |
+                            ForEach-Object { "$_".Replace('|', '/') }) -join '|'
+                    })
+                    $nics = @(foreach ($n in @($nicByHost[$host_])) {
+                        if (-not $n) { continue }
+                        $np = Get-PropMap $n ''
+                        (($n.DisplayName, $np['MACAddress'], $np['IPAddress'], $np['IPSubnet'],
+                          $np['DefaultIPGateway'], $np['DHCPEnabled']) |
+                            ForEach-Object { "$_".Replace('|', '/') }) -join '|'
+                    })
+
+                    [pscustomobject]@{
+                        Computer          = $host_
+                        HealthState       = "$($c.HealthState)"
+                        InMaintenanceMode = [bool]$c.InMaintenanceMode
+                        Properties        = @($props.GetEnumerator() | Sort-Object Name |
+                            ForEach-Object { "$($_.Key)=$($_.Value)" })
+                        Disks             = $disks
+                        NetworkAdapters   = $nics
+                    }
+                }
+            }
+        }
+        @{
+            # Root-cause chain for ONE alert: the monitor/rule that raised it, its management
+            # pack, the vendor's knowledge article (cause + resolution text) and the overrides
+            # actually in effect. This is what a SCOM engineer opens the console to check.
+            Name        = 'Get-AIOpsScomAlertDetail'
+            ScriptBlock = {
+                param(
+                    [Parameter(Mandatory)] [string] $AlertId,
+                    [ValidateRange(200, 20000)] [int] $MaxKnowledgeLength = 4000
+                )
+                if (-not (Get-Module OperationsManager)) { Import-Module OperationsManager -ErrorAction Stop }
+                $a = Get-SCOMAlert -Id $AlertId -ErrorAction SilentlyContinue
+                if (-not $a) { return }
+
+                # MonitoringRuleId holds a MONITOR id when IsMonitorAlert, a RULE id otherwise.
+                $src = $null
+                if ($a.MonitoringRuleId) {
+                    $src = if ($a.IsMonitorAlert) { Get-SCOMMonitor -Id $a.MonitoringRuleId -ErrorAction SilentlyContinue }
+                           else                   { Get-SCOMRule    -Id $a.MonitoringRuleId -ErrorAction SilentlyContinue }
+                }
+
+                $mpName = ''; $mpVersion = ''; $targetClass = ''; $kb = ''
+                if ($src) {
+                    $mp = $src.GetManagementPack()
+                    # Many sealed MPs have an empty DisplayName — fall back to Name.
+                    if ($mp) {
+                        $mpName = $(if ($mp.DisplayName) { $mp.DisplayName } else { $mp.Name })
+                        $mpVersion = "$($mp.Version)"
+                    }
+                    if ($src.Target) {
+                        $tc = $src.Target.GetElement()
+                        if ($tc) { $targetClass = $(if ($tc.DisplayName) { $tc.DisplayName } else { $tc.Name }) }
+                    }
+                    # Singular, language-coded, and returns MAML XML — strip tags for the LLM.
+                    try {
+                        $ka = $src.GetKnowledgeArticle('ENU')
+                        if ($ka -and $ka.MamlContent) {
+                            $kb = ((($ka.MamlContent -replace '<[^>]+>', ' ') -replace '\s+', ' ')).Trim()
+                            if ($kb.Length -gt $MaxKnowledgeLength) { $kb = $kb.Substring(0, $MaxKnowledgeLength) }
+                        }
+                    } catch { $kb = '' }
+                }
+
+                # Overrides in effect on this workflow. Property overrides carry .Property
+                # (Enabled, GenerateAlert); configuration overrides carry .Parameter (Threshold).
+                $ovr = @()
+                if ($src) {
+                    $list = if ($a.IsMonitorAlert) { Get-SCOMOverride -Monitor $src -ErrorAction SilentlyContinue }
+                            else                   { Get-SCOMOverride -Rule    $src -ErrorAction SilentlyContinue }
+                    foreach ($x in @($list)) {
+                        if (-not $x) { continue }
+                        $field = $(if ($x.Property) { "$($x.Property)" } else { "$($x.Parameter)" })
+                        $ctx = ''
+                        if ($x.Context) { $ctx = "$($x.Context.Identifier.Path)" }
+                        $omp = $x.GetManagementPack()
+                        $ompName = ''
+                        if ($omp) { $ompName = $(if ($omp.DisplayName) { $omp.DisplayName } else { $omp.Name }) }
+                        $ovr += (($field, "$($x.Value)", $ctx, $ompName, "$($x.Enforced)") |
+                            ForEach-Object { "$_".Replace('|', '/') }) -join '|'
+                    }
+                }
+
+                $objHealth = ''
+                if ($a.MonitoringObjectId) {
+                    $mo = Get-SCOMClassInstance -Id $a.MonitoringObjectId -ErrorAction SilentlyContinue
+                    if ($mo) { $objHealth = "$($mo.HealthState)" }
+                }
+
+                # Resolution timeline (who/when/what), oldest first.
+                $hist = @()
+                foreach ($h in @($a.GetMonitoringAlertHistory() | Sort-Object TimeModified)) {
+                    $hist += (("$([datetime]::SpecifyKind($h.TimeModified,'Utc').ToString('o'))", "$($h.ModifiedBy)",
+                               "$($h.ResolutionState)", "$($h.Comments)") |
+                        ForEach-Object { "$_".Replace('|', '/') }) -join '|'
+                }
+
+                [pscustomobject]@{
+                    Id                          = $a.Id.ToString()
+                    Name                        = $a.Name
+                    Description                 = $a.Description
+                    Severity                    = "$($a.Severity)"
+                    ResolutionState             = [int]$a.ResolutionState
+                    MonitoringObjectDisplayName = $a.MonitoringObjectDisplayName
+                    MonitoringObjectHealthState = $objHealth
+                    TimeRaised                  = $a.TimeRaised
+                    SourceKind                  = $(if ($a.IsMonitorAlert) { 'Monitor' } else { 'Rule' })
+                    SourceName                  = $(if ($src) { $(if ($src.DisplayName) { $src.DisplayName } else { $src.Name }) } else { '' })
+                    TargetClass                 = $targetClass
+                    ManagementPack              = $mpName
+                    ManagementPackVersion       = $mpVersion
+                    KnowledgeArticle            = $kb
+                    Overrides                   = $ovr
+                    History                     = $hist
+                }
+            }
+        }
+        @{
+            # Per-monitor health timeline: when a monitor flipped, from what to what. This is
+            # the one dataset the agentless JEA path genuinely cannot reproduce.
+            Name        = 'Get-AIOpsScomStateChanges'
+            ScriptBlock = {
+                param(
+                    [Parameter(Mandatory)] [string] $ObjectName,
+                    [ValidateRange(1, 720)] [int] $Hours = 24,
+                    [ValidateRange(1, 500)] [int] $MaxChanges = 100,
+                    [switch] $OnlyUnhealthy
+                )
+                if (-not (Get-Module OperationsManager)) { Import-Module OperationsManager -ErrorAction Stop }
+                $mg = Get-SCOMManagementGroup
+                $since = [datetime]::UtcNow.AddHours(-$Hours)
+                $objs = @(Get-SCOMMonitoringObject | Where-Object { $_.DisplayName -like $ObjectName -or $_.Path -like $ObjectName })
+                $monCache = @{}   # class id -> monitors, so repeated classes cost one lookup
+                # Collect, then sort by time, then cap. Stopping at the cap during enumeration
+                # returned whichever monitor happened to be walked first: one flapping disk
+                # monitor with 300 transitions filled the whole answer and the single service
+                # failure that explained the incident was never reached. The scan ceiling keeps
+                # a 30-day window from materializing without bound; it is far above the cap, so
+                # enumeration order only matters in genuinely extreme cases.
+                $scanCeiling = [Math]::Max(2000, $MaxChanges * 20)
+                $collected = [System.Collections.Generic.List[object]]::new()
+
+                foreach ($o in $objs) {
+                    if ($collected.Count -ge $scanCeiling) { break }
+                    # Resolve monitors by walking EVERY class of the instance: Get-SCOMMonitor
+                    # -Target <exact class> alone returns an empty set for many classes, and
+                    # GetMonitoringStates then throws on the empty collection.
+                    $list = [System.Collections.Generic.List[Microsoft.EnterpriseManagement.Configuration.ManagementPackMonitor]]::new()
+                    $seen = [System.Collections.Generic.HashSet[guid]]::new()
+                    foreach ($cid in $o.MonitoringClassIds) {
+                        if (-not $monCache.ContainsKey($cid)) {
+                            $k = $mg.EntityTypes.GetClass($cid)
+                            $monCache[$cid] = @(Get-SCOMMonitor -Target $k -ErrorAction SilentlyContinue)
+                        }
+                        foreach ($m in $monCache[$cid]) {
+                            if ($m -and $seen.Add($m.Id)) { $list.Add($m) }
+                        }
+                    }
+                    if ($list.Count -eq 0) { continue }
+
+                    # The two overloads (ICollection<T> / IEnumerable<T>) are ambiguous for a
+                    # plain PS array; the explicit cast picks one.
+                    $states = @()
+                    try {
+                        $states = @($o.GetMonitoringStates(
+                            [System.Collections.Generic.ICollection[Microsoft.EnterpriseManagement.Configuration.ManagementPackMonitor]]$list))
+                    } catch { continue }
+
+                    foreach ($st in $states) {
+                        # GetStateChangeEvents() takes no criteria overload — filter here.
+                        foreach ($e in @($st.GetStateChangeEvents())) {
+                            if ($e.TimeGenerated -lt $since) { continue }
+                            if ($OnlyUnhealthy -and "$($e.NewHealthState)" -eq 'Success') { continue }
+                            if ($collected.Count -ge $scanCeiling) { break }
+                            $collected.Add([pscustomobject]@{
+                                Server         = $(if ($o.Path) { $o.Path } else { $o.DisplayName })
+                                MonitoringObject = $o.DisplayName
+                                Monitor        = "$($st.MonitorDisplayName)"
+                                TimeGeneratedUtc = $e.TimeGenerated
+                                OldHealthState = "$($e.OldHealthState)"
+                                NewHealthState = "$($e.NewHealthState)"
+                            })
+                        }
+                    }
+                }
+
+                $collected | Sort-Object -Property TimeGeneratedUtc -Descending | Select-Object -First $MaxChanges
+            }
+        }
+        @{
+            # "Is monitoring itself telling the truth?" — grey agents, heartbeat settings,
+            # maintenance mode, management-server health, pending agents, retention window and
+            # whether anyone is even subscribed to notifications.
+            Name        = 'Get-AIOpsScomMonitoringHealth'
+            ScriptBlock = {
+                param(
+                    [ValidateRange(1, 500)] [int] $MaxRows = 200
+                )
+                if (-not (Get-Module OperationsManager)) { Import-Module OperationsManager -ErrorAction Stop }
+
+                $mg = Get-SCOMManagementGroup
+                $servers = @(Get-SCOMManagementServer -ErrorAction SilentlyContinue)
+                $agents  = @(Get-SCOMAgent -ErrorAction SilentlyContinue)
+
+                # Heartbeat truth lives on the watcher, not on the agent object: Get-SCOMAgent
+                # has no last-heartbeat property at all.
+                $watchers = @()
+                $wcls = Get-SCOMClass -Name 'Microsoft.SystemCenter.HealthServiceWatcher' -ErrorAction SilentlyContinue
+                if ($wcls) { $watchers = @(Get-SCOMClassInstance -Class $wcls -ErrorAction SilentlyContinue) }
+                # Grey means the health service watcher has stopped hearing from the agent: the watcher is
+                # Uninitialized or unavailable. A Warning or Error watcher is an agent that IS reporting
+                # and has something wrong with it — counting those as grey told the LLM that a healthy,
+                # fully reporting host was unmonitored, which invalidates every other answer about it.
+                $grey = @($watchers | Where-Object { -not $_.IsAvailable -or "$($_.HealthState)" -eq 'Uninitialized' })
+
+                $hb = Get-SCOMHeartbeatSetting -ErrorAction SilentlyContinue
+                $groom = Get-SCOMDatabaseGroomingSetting -ErrorAction SilentlyContinue
+                $pending = @(Get-SCOMPendingManagement -ErrorAction SilentlyContinue)
+                $subs = @(Get-SCOMNotificationSubscription -ErrorAction SilentlyContinue)
+
+                # Maintenance mode: there is no global "list everything in MM" cmdlet, so scan
+                # the flag that every monitoring object already carries.
+                $inMm = @()
+                $ccls = Get-SCOMClass -Name 'Microsoft.Windows.Computer' -ErrorAction SilentlyContinue
+                if ($ccls) {
+                    foreach ($i in @(Get-SCOMClassInstance -Class $ccls -ErrorAction SilentlyContinue |
+                                     Where-Object { $_.InMaintenanceMode })) {
+                        $mm = Get-SCOMMaintenanceMode -Instance $i -ErrorAction SilentlyContinue
+                        $inMm += (("$($i.DisplayName)", "$(if ($mm.StartTime) { [datetime]::SpecifyKind($mm.StartTime,'Utc').ToString('o') })", "$(if ($mm.ScheduledEndTime) { [datetime]::SpecifyKind($mm.ScheduledEndTime,'Utc').ToString('o') })",
+                                   "$($mm.Reason)", "$($mm.User)") |
+                            ForEach-Object { "$_".Replace('|', '/') }) -join '|'
+                    }
+                }
+
+                # Coverage gap: discovered Windows computers that have no agent. The management
+                # server itself legitimately has none, so it is reported, not hidden.
+                $agentNames = @($agents | ForEach-Object { "$($_.DisplayName)" })
+                $compNames = @()
+                if ($ccls) { $compNames = @(Get-SCOMClassInstance -Class $ccls -ErrorAction SilentlyContinue | ForEach-Object { "$($_.DisplayName)" }) }
+                $noAgent = @($compNames | Where-Object { $agentNames -notcontains $_ })
+
+                [pscustomobject]@{
+                    ManagementGroup     = "$($mg.Name)"
+                    ManagementGroupVersion = "$($mg.Version)"
+                    IsConnected         = [bool]$mg.IsConnected
+                    AgentCount          = [int]$agents.Count
+                    GreyAgentCount      = [int]$grey.Count
+                    PendingAgentCount   = [int]$pending.Count
+                    NotificationSubscriptionCount = [int]$subs.Count
+                    HeartbeatIntervalSeconds = $(if ($hb) { [int]$hb.AgentHeartbeatInterval } else { 0 })
+                    MissingHeartbeatThreshold = $(if ($hb) { [int]$hb.MissingHeartbeatThreshold } else { 0 })
+                    # Grooming is per data type; these two bound how far back
+                    # get_scom_performance and get_scom_state_changes can meaningfully ask.
+                    PerformanceRetentionDays = $(if ($groom) { [int]$groom.PerformanceDataDaysToKeep } else { 0 })
+                    StateChangeRetentionDays = $(if ($groom) { [int]$groom.StateChangeEventDaysToKeep } else { 0 })
+                    ManagementServers   = @($servers | Select-Object -First $MaxRows | ForEach-Object {
+                        (("$($_.DisplayName)", "$($_.HealthState)", "$($_.Version)", "$($_.IsRootManagementServer)") |
+                            ForEach-Object { "$_".Replace('|', '/') }) -join '|' })
+                    Agents              = @($agents | Select-Object -First $MaxRows | ForEach-Object {
+                        (("$($_.DisplayName)", "$($_.HealthState)", "$($_.Version)",
+                          "$($_.PrimaryManagementServerName)", "$($_.ProxyingEnabled)") |
+                            ForEach-Object { "$_".Replace('|', '/') }) -join '|' })
+                    GreyAgents          = @($grey | Select-Object -First $MaxRows | ForEach-Object {
+                        (("$($_.DisplayName)", "$($_.HealthState)", "$($_.IsAvailable)", "$(if ($_.StateLastModified) { [datetime]::SpecifyKind($_.StateLastModified,'Utc').ToString('o') })") |
+                            ForEach-Object { "$_".Replace('|', '/') }) -join '|' })
+                    InMaintenanceMode   = @($inMm | Select-Object -First $MaxRows)
+                    ComputersWithoutAgent = @($noAgent | Select-Object -First $MaxRows)
+                }
+            }
+        }
+        @{
+            Name        = 'Get-AIOpsScomHealth'
+            ScriptBlock = {
+                param(
+                    [Parameter(Mandatory)] [string] $Pattern,
+                    [ValidateRange(1, 500)] [int] $MaxCount = 100
+                )
+                if (-not (Get-Module OperationsManager)) { Import-Module OperationsManager -ErrorAction Stop }
+                Get-SCOMMonitoringObject -DisplayName $Pattern |
+                    Sort-Object DisplayName |
+                    Select-Object -First $MaxCount |
+                    ForEach-Object {
+                        [pscustomobject]@{
+                            DisplayName       = $_.DisplayName
+                            FullName          = $_.FullName
+                            Path              = $_.Path
+                            HealthState       = "$($_.HealthState)"
+                            IsAvailable       = [bool]$_.IsAvailable
+                            InMaintenanceMode = [bool]$_.InMaintenanceMode
+                            StateLastModified = $_.StateLastModified
+                        }
+                    }
+            }
+        }
+    )
+}

@@ -1,0 +1,23 @@
+# AIOpsReader session configuration.
+# __AIOPS_PRINCIPAL__ is replaced by Register-AIOpsReader.ps1 with the gMSA
+# (e.g. 'CONTOSO\gMSA-AIOps$') or an AD group holding it.
+@{
+    SchemaVersion        = '2.0.0.0'
+    GUID                 = 'a1b2c3d4-5e6f-4a7b-8c9d-0e1f2a3b4c5d'
+    Author               = 'AIOps'
+    Description          = 'Read-only JEA endpoint for the AIOps MCP server.'
+
+    SessionType          = 'RestrictedRemoteServer'
+    LanguageMode         = 'NoLanguage'
+    ExecutionPolicy      = 'Restricted'
+
+    RunAsVirtualAccount  = $true
+
+    TranscriptDirectory  = 'C:\ProgramData\AIOps\Transcripts'
+
+    RoleDefinitions      = @{
+        '__AIOPS_PRINCIPAL__' = @{
+            RoleCapabilities = 'AIOpsReader'
+        }
+    }
+}

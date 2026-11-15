@@ -1,0 +1,24 @@
+# Build output
+bin/
+obj/
+artifacts/
+publish/
+TestResults/
+
+# Runtime output
+logs/
+*.log
+
+# Environment-specific configuration: host names, connection strings and allow-lists
+# belong to a deployment, never to the repository. The template lives in
+# deploy/appsettings.Production.example.json.
+appsettings.Production.json
+appsettings.*.local.json
+*.bak
+
+# IDE and local tooling
+.vs/
+.idea/
+*.user
+*.suo
+.claude/
