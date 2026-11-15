@@ -410,8 +410,17 @@
                 # $unavailable, and agents / management servers fall back to their monitoring
                 # class instances, which a read-only operator can see (name and health only).
                 $unavailable = [System.Collections.Generic.List[string]]::new()
+                # Ask for the role first; do NOT discover it by trial. Every administrative call
+                # a non-administrator makes is logged by the Data Access Service as an error
+                # (event 26319, UnauthorizedAccessEnterpriseManagementException) in the
+                # management server's own Operations Manager log - six of them per invocation
+                # of this function, which is how a monitoring tool polled 25 times left 162
+                # error events on the server it was supposed to be observing.
+                $isAdmin = $false
+                try { $isAdmin = [bool]$mg.IsUserAdministrator() } catch { $isAdmin = $false }
                 $tryAdmin = {
                     param([string] $label, [scriptblock] $read)
+                    if (-not $isAdmin) { $unavailable.Add($label); return , $null }
                     try { , @(& $read) } catch { $unavailable.Add($label); , $null }
                 }
 

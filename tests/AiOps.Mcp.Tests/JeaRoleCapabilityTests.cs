@@ -184,6 +184,33 @@ public class JeaRoleCapabilityTests
     }
 
     [Fact]
+    public void Monitoring_health_asks_for_the_role_instead_of_probing_administrative_calls()
+    {
+        // The service account is a Read-Only Operator. Each administrative SDK call it makes is
+        // refused AND logged by SCOM as an error event (26319) on the management server, so
+        // "try it and catch the refusal" turned every invocation into six error events in the
+        // very log the tool exists to help read. The role must be asked for up front.
+        var body = ((IEnumerable)LoadPsrc(ScomRole)["FunctionDefinitions"]!).Cast<Hashtable>()
+            .Single(f => (string)f["Name"]! == "Get-AIOpsScomMonitoringHealth")["ScriptBlock"]!
+            .ToString() ?? "";
+
+        Assert.Contains("IsUserAdministrator()", body, StringComparison.Ordinal);
+        Assert.Contains("if (-not $isAdmin)", body, StringComparison.Ordinal);
+
+        // No administrative read may run outside the guarded helper.
+        string[] adminCmdlets =
+        [
+            "Get-SCOMManagementServer", "Get-SCOMAgent", "Get-SCOMHeartbeatSetting",
+            "Get-SCOMDatabaseGroomingSetting", "Get-SCOMPendingManagement", "Get-SCOMNotificationSubscription",
+        ];
+        foreach (var line in body.Split('\n').Where(l => !l.TrimStart().StartsWith('#')))
+        {
+            foreach (var cmdlet in adminCmdlets.Where(c => line.Contains(c, StringComparison.Ordinal)))
+                Assert.True(line.Contains("& $tryAdmin", StringComparison.Ordinal), $"{cmdlet} is called outside the role guard: {line.Trim()}");
+        }
+    }
+
+    [Fact]
     public void Grey_agent_detection_means_not_reporting_not_merely_unhealthy()
     {
         // A grey agent is one SCOM has stopped hearing from: the health service watcher is
