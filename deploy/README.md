@@ -33,13 +33,29 @@ Copy the zip to the MCP host and extract it. It contains `publish\` (the applica
 ### Step 2 — Create the gMSA (domain admin)
 
 ```powershell
-New-ADServiceAccount -Name 'gMSA-AIOps' -DNSHostName 'gmsa-aiops.<domain-fqdn>' `
-    -PrincipalsAllowedToRetrieveManagedPassword '<mcp-host>$'
+# Once per forest, if no gMSA has ever been created in it. Wait 10 hours before the next
+# command so the key replicates (in a single-DC lab: -EffectiveTime (Get-Date).AddHours(-10)).
+Add-KdsRootKey -EffectiveImmediately
 
-# then on the MCP host (needs the ActiveDirectory module: Install-WindowsFeature RSAT-AD-PowerShell)
-Install-ADServiceAccount 'gMSA-AIOps'
-Test-ADServiceAccount 'gMSA-AIOps'        # must print True
+# A group of the computers allowed to run the service: adding another MCP host later is
+# a group-membership change, not a change to the account.
+New-ADGroup -Name 'AIOps-MCP-Hosts' -GroupScope Global -GroupCategory Security
+Add-ADGroupMember -Identity 'AIOps-MCP-Hosts' -Members '<mcp-host>$'
+New-ADServiceAccount -Name 'gMSA-AIOps' -DNSHostName 'gmsa-aiops.<domain-fqdn>' `
+    -PrincipalsAllowedToRetrieveManagedPassword 'AIOps-MCP-Hosts'
 ```
+
+A computer's new group membership takes effect only when it renews its Kerberos ticket.
+On the MCP host, elevated, either reboot or run:
+
+```powershell
+klist -li 0x3e7 purge
+```
+
+Without this the service fails to start with error 1069 (logon failure) even though
+everything in AD is correct. Optionally confirm with the ActiveDirectory module
+(`Install-WindowsFeature RSAT-AD-PowerShell`): `Test-ADServiceAccount 'gMSA-AIOps'` must
+print True. The module is not required: the installer in Step 7 works without it.
 
 ### Step 3 — Create the database (DBA)
 
