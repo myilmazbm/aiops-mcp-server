@@ -254,7 +254,18 @@ public sealed class PsSessionPoolTests : IDisposable
         Assert.Equal(2, _connector.ConnectCounts["srv1"]);
         Assert.Equal(1, _connector.ConnectCounts["srv3"]);
         // The evicted runspace must actually be closed, not merely forgotten (WinRM quota leak).
+        // Eviction closes it off the pool gate, on a background task, so wait for it: asserting
+        // immediately raced that task and failed on a slower CI runner.
+        await WaitUntil(() => evicted.RunspaceStateInfo.State != RunspaceState.Opened);
         Assert.Equal(RunspaceState.Closed, evicted.RunspaceStateInfo.State);
+    }
+
+    /// <summary>Polls for a condition a background task will make true; the assert that follows reports a timeout.</summary>
+    private static async Task WaitUntil(Func<bool> condition)
+    {
+        var deadline = DateTime.UtcNow.AddSeconds(15);
+        while (!condition() && DateTime.UtcNow < deadline)
+            await Task.Delay(20);
     }
 
     [Fact]
@@ -277,7 +288,9 @@ public sealed class PsSessionPoolTests : IDisposable
         Assert.All(states, s => Assert.Equal(RunspaceState.Opened, s));
 
         // After disposing, no runspace the pool ever created may still be open.
+        // Sessions evicted during the run are closed on background tasks; give those a moment.
         pool.Dispose();
+        await WaitUntil(() => _connector.Created.All(rs => rs.RunspaceStateInfo.State != RunspaceState.Opened));
         Assert.DoesNotContain(_connector.Created, rs => rs.RunspaceStateInfo.State == RunspaceState.Opened);
     }
 
