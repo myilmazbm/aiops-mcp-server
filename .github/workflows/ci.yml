@@ -1,0 +1,28 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    # Windows only: the server hosts the PowerShell SDK and talks WSMan, and the unit
+    # tests exercise real in-process runspaces.
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Build
+        run: dotnet build --configuration Release
+
+      # Unit tests only. tests/AiOps.Mcp.LabTests needs a real fleet and never runs here.
+      - name: Test
+        run: dotnet test tests/AiOps.Mcp.Tests --configuration Release --no-build
