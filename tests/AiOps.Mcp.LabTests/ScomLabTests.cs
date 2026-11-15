@@ -190,7 +190,7 @@ public class ScomLabTests
 
         var result = await ScomTools.GetScomMonitoringHealth(executor, scom, NullLoggerFactory.Instance);
 
-        Assert.Equal("ok", result.Status);
+        Assert.Contains(result.Status, new[] { "ok", "partial" });   // partial: role is Read-Only Operator
         Assert.False(string.IsNullOrEmpty(result.ManagementGroup));
         Assert.True(result.IsConnected);
         Assert.NotEmpty(result.ManagementServers);
@@ -199,8 +199,13 @@ public class ScomLabTests
         Assert.Equal(result.GreyAgentCount, result.GreyAgents.Count);
         Assert.All(result.GreyAgents, g => Assert.Contains(result.Agents, a => a.Name == g.Name));
         // Retention bounds every history query; zero would mean the grooming read failed.
-        Assert.True(result.PerformanceRetentionDays > 0);
-        Assert.True(result.StateChangeRetentionDays > 0);
-        Assert.True(result.HeartbeatIntervalSeconds > 0);
+        // A Read-Only Operator cannot read the settings; then they are null and named in Unavailable.
+        if (!result.Unavailable.Contains("retention settings"))
+        {
+            Assert.True(result.PerformanceRetentionDays > 0);
+            Assert.True(result.StateChangeRetentionDays > 0);
+        }
+        if (!result.Unavailable.Contains("heartbeat settings"))
+            Assert.True(result.HeartbeatIntervalSeconds > 0);
     }
 }

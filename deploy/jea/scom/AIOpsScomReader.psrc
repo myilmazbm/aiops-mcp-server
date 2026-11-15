@@ -399,8 +399,39 @@
                 if (-not (Get-Module OperationsManager)) { Import-Module OperationsManager -ErrorAction Stop }
 
                 $mg = Get-SCOMManagementGroup
-                $servers = @(Get-SCOMManagementServer -ErrorAction SilentlyContinue)
-                $agents  = @(Get-SCOMAgent -ErrorAction SilentlyContinue)
+
+                # The session runs as the caller, whose SCOM role is Read-Only Operator. The
+                # administration cmdlets below (agents, management servers, settings) need the
+                # SCOM Administrator role and fail for it. Swallowing that failure made this
+                # function return status 'ok' with zero agents, zero retention and EVERY
+                # computer listed as having no agent - a confident, wrong answer, and one that
+                # stayed hidden for as long as the endpoint was only tested by a SCOM admin.
+                # So: every administrative read is attempted, a refusal is recorded by name in
+                # $unavailable, and agents / management servers fall back to their monitoring
+                # class instances, which a read-only operator can see (name and health only).
+                $unavailable = [System.Collections.Generic.List[string]]::new()
+                $tryAdmin = {
+                    param([string] $label, [scriptblock] $read)
+                    try { , @(& $read) } catch { $unavailable.Add($label); , $null }
+                }
+
+                $servers = & $tryAdmin 'management server details' { Get-SCOMManagementServer -ErrorAction Stop }
+                $agents  = & $tryAdmin 'agent details' { Get-SCOMAgent -ErrorAction Stop }
+                $byClass = {
+                    param([string] $className)
+                    $cl = Get-SCOMClass -Name $className -ErrorAction SilentlyContinue
+                    if ($cl) { @(Get-SCOMClassInstance -Class $cl -ErrorAction SilentlyContinue) } else { @() }
+                }
+                # An empty result is treated like a refusal when the class instances say otherwise:
+                # the SDK may answer a read-only operator with nothing rather than with an error.
+                if ($null -eq $servers -or $servers.Count -eq 0) {
+                    $servers = @(& $byClass 'Microsoft.SystemCenter.ManagementServer')
+                    if ($servers.Count -gt 0 -and -not $unavailable.Contains('management server details')) { $unavailable.Add('management server details') }
+                }
+                if ($null -eq $agents -or $agents.Count -eq 0) {
+                    $agents = @(& $byClass 'Microsoft.SystemCenter.Agent')
+                    if ($agents.Count -gt 0 -and -not $unavailable.Contains('agent details')) { $unavailable.Add('agent details') }
+                }
 
                 # Heartbeat truth lives on the watcher, not on the agent object: Get-SCOMAgent
                 # has no last-heartbeat property at all.
@@ -413,10 +444,11 @@
                 # fully reporting host was unmonitored, which invalidates every other answer about it.
                 $grey = @($watchers | Where-Object { -not $_.IsAvailable -or "$($_.HealthState)" -eq 'Uninitialized' })
 
-                $hb = Get-SCOMHeartbeatSetting -ErrorAction SilentlyContinue
-                $groom = Get-SCOMDatabaseGroomingSetting -ErrorAction SilentlyContinue
-                $pending = @(Get-SCOMPendingManagement -ErrorAction SilentlyContinue)
-                $subs = @(Get-SCOMNotificationSubscription -ErrorAction SilentlyContinue)
+                # Settings have no monitoring-object equivalent: unreadable means null, never 0.
+                $hb      = @(& $tryAdmin 'heartbeat settings' { Get-SCOMHeartbeatSetting -ErrorAction Stop })[0]
+                $groom   = @(& $tryAdmin 'retention settings' { Get-SCOMDatabaseGroomingSetting -ErrorAction Stop })[0]
+                $pending = & $tryAdmin 'pending agents' { Get-SCOMPendingManagement -ErrorAction Stop }
+                $subs    = & $tryAdmin 'notification subscriptions' { Get-SCOMNotificationSubscription -ErrorAction Stop }
 
                 # Maintenance mode: there is no global "list everything in MM" cmdlet, so scan
                 # the flag that every monitoring object already carries.
@@ -445,14 +477,16 @@
                     IsConnected         = [bool]$mg.IsConnected
                     AgentCount          = [int]$agents.Count
                     GreyAgentCount      = [int]$grey.Count
-                    PendingAgentCount   = [int]$pending.Count
-                    NotificationSubscriptionCount = [int]$subs.Count
-                    HeartbeatIntervalSeconds = $(if ($hb) { [int]$hb.AgentHeartbeatInterval } else { 0 })
-                    MissingHeartbeatThreshold = $(if ($hb) { [int]$hb.MissingHeartbeatThreshold } else { 0 })
+                    PendingAgentCount   = $(if ($null -ne $pending) { [int]$pending.Count } else { $null })
+                    NotificationSubscriptionCount = $(if ($null -ne $subs) { [int]$subs.Count } else { $null })
+                    HeartbeatIntervalSeconds = $(if ($hb) { [int]$hb.AgentHeartbeatInterval } else { $null })
+                    MissingHeartbeatThreshold = $(if ($hb) { [int]$hb.MissingHeartbeatThreshold } else { $null })
                     # Grooming is per data type; these two bound how far back
                     # get_scom_performance and get_scom_state_changes can meaningfully ask.
-                    PerformanceRetentionDays = $(if ($groom) { [int]$groom.PerformanceDataDaysToKeep } else { 0 })
-                    StateChangeRetentionDays = $(if ($groom) { [int]$groom.StateChangeEventDaysToKeep } else { 0 })
+                    PerformanceRetentionDays = $(if ($groom) { [int]$groom.PerformanceDataDaysToKeep } else { $null })
+                    StateChangeRetentionDays = $(if ($groom) { [int]$groom.StateChangeEventDaysToKeep } else { $null })
+                    # Names of the parts the caller's SCOM role could not read (empty for an administrator).
+                    Unavailable         = @($unavailable)
                     ManagementServers   = @($servers | Select-Object -First $MaxRows | ForEach-Object {
                         (("$($_.DisplayName)", "$($_.HealthState)", "$($_.Version)", "$($_.IsRootManagementServer)") |
                             ForEach-Object { "$_".Replace('|', '/') }) -join '|' })

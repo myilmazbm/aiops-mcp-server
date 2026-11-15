@@ -557,18 +557,19 @@ public class ScomToolsTests
         public bool IsConnected { get; init; } = true;
         public int AgentCount { get; init; } = 6;
         public int GreyAgentCount { get; init; } = 1;
-        public int PendingAgentCount { get; init; }
-        public int NotificationSubscriptionCount { get; init; }
-        public int HeartbeatIntervalSeconds { get; init; } = 60;
-        public int MissingHeartbeatThreshold { get; init; } = 3;
-        public int PerformanceRetentionDays { get; init; } = 7;
-        public int StateChangeRetentionDays { get; init; } = 3;
+        public int? PendingAgentCount { get; init; } = 0;
+        public int? NotificationSubscriptionCount { get; init; } = 0;
+        public int? HeartbeatIntervalSeconds { get; init; } = 60;
+        public int? MissingHeartbeatThreshold { get; init; } = 3;
+        public int? PerformanceRetentionDays { get; init; } = 7;
+        public int? StateChangeRetentionDays { get; init; } = 3;
         public string[] ManagementServers { get; init; } = ["SCOM01.contoso.local|Success|10.25.10132.0|True"];
         public string[] Agents { get; init; } = ["DC01.contoso.local|Success|10.25.10079.0|SCOM01.contoso.local|True"];
         public string[] GreyAgents { get; init; } = ["EXC01.contoso.local|Error|False|2026-09-16T06:47:03.0000000Z"];
         public string[] InMaintenanceMode { get; init; } =
             ["WEB01.contoso.local|2026-09-17T20:00:00.0000000Z|2026-09-17T22:00:00.0000000Z|PlannedOther|CONTOSO\\dev"];
         public string[] ComputersWithoutAgent { get; init; } = ["SCOM01.contoso.local"];
+        public string[] Unavailable { get; init; } = [];
     }
 
     [Fact]
@@ -693,5 +694,54 @@ public class ScomToolsTests
         var window = Assert.Single(result.InMaintenanceMode);
         Assert.Equal(new DateTimeOffset(2026, 9, 17, 20, 0, 0, TimeSpan.Zero), window.Start);
         Assert.Equal(new DateTimeOffset(2026, 9, 17, 22, 0, 0, TimeSpan.Zero), window.ScheduledEnd);
+    }
+
+    // --- reads the SCOM role refused ---
+    // The service account is a Read-Only Operator by design. Agent details, management-server
+    // details and the settings need SCOM Administrator, and the wrapper used to swallow that
+    // refusal: the tool answered status ok with zero agents, zero retention and every computer
+    // listed as having no agent. It stayed hidden for as long as the endpoint was only ever
+    // exercised by an account that happened to be a SCOM administrator.
+
+    [Fact]
+    public async Task Reads_the_scom_role_refused_are_reported_as_partial_not_as_zeros()
+    {
+        Respond(Ok(new FakeMonitoringHealth
+        {
+            Unavailable = ["agent details", "heartbeat settings", "retention settings"],
+            HeartbeatIntervalSeconds = null,
+            MissingHeartbeatThreshold = null,
+            PerformanceRetentionDays = null,
+            StateChangeRetentionDays = null,
+            Agents = ["DC01.contoso.local|Success|||"],
+        }));
+
+        var result = await ScomTools.GetScomMonitoringHealth(_executor, Configured, NullLoggerFactory.Instance);
+
+        Assert.Equal("partial", result.Status);
+        Assert.Equal(["agent details", "heartbeat settings", "retention settings"], result.Unavailable);
+        Assert.Contains("SCOM Administrator", result.Error);
+        // Unknown is null. Zero would read as "retention is zero days" / "no heartbeat configured".
+        Assert.Null(result.PerformanceRetentionDays);
+        Assert.Null(result.StateChangeRetentionDays);
+        Assert.Null(result.HeartbeatIntervalSeconds);
+        // The fallback still yields the agent by name and health; only the details are blank.
+        var agent = Assert.Single(result.Agents);
+        Assert.Equal("DC01.contoso.local", agent.Name);
+        Assert.Equal("Success", agent.HealthState);
+        Assert.Null(agent.Version);
+    }
+
+    [Fact]
+    public async Task A_fully_readable_report_stays_ok_with_nothing_unavailable()
+    {
+        Respond(Ok(new FakeMonitoringHealth()));
+
+        var result = await ScomTools.GetScomMonitoringHealth(_executor, Configured, NullLoggerFactory.Instance);
+
+        Assert.Equal("ok", result.Status);
+        Assert.Empty(result.Unavailable);
+        Assert.Null(result.Error);
+        Assert.Equal(7, result.PerformanceRetentionDays);
     }
 }

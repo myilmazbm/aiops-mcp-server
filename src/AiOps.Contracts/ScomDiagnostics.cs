@@ -100,10 +100,19 @@ public sealed record ScomStateChangeDto
 /// </summary>
 public sealed record GetScomMonitoringHealthResult
 {
-    /// <summary>ok | unreachable | error</summary>
+    /// <summary>ok | partial | unreachable | error</summary>
     public required string Status { get; init; }
 
     public string? Error { get; init; }
+
+    /// <summary>
+    /// Parts the service account's SCOM role could not read. The account is a Read-Only
+    /// Operator by design, and agent details, management-server details and the settings
+    /// below need the SCOM Administrator role. When this is non-empty the status is
+    /// "partial": the affected settings are null (not zero), and agents and management
+    /// servers carry name and health only. Everything else is real.
+    /// </summary>
+    public IReadOnlyList<string> Unavailable { get; init; } = [];
 
     public string? ManagementGroup { get; init; }
     public string? ManagementGroupVersion { get; init; }
@@ -112,17 +121,17 @@ public sealed record GetScomMonitoringHealthResult
     public int AgentCount { get; init; }
     /// <summary>Agents whose watcher is not healthy — i.e. SCOM has stopped hearing from them.</summary>
     public int GreyAgentCount { get; init; }
-    public int PendingAgentCount { get; init; }
+    public int? PendingAgentCount { get; init; }
     /// <summary>Zero means nobody is being notified of anything, however well monitoring works.</summary>
-    public int NotificationSubscriptionCount { get; init; }
+    public int? NotificationSubscriptionCount { get; init; }
 
-    public int HeartbeatIntervalSeconds { get; init; }
-    public int MissingHeartbeatThreshold { get; init; }
+    public int? HeartbeatIntervalSeconds { get; init; }
+    public int? MissingHeartbeatThreshold { get; init; }
     /// <summary>Retention for collected performance data; bounds get_scom_performance.</summary>
-    public int PerformanceRetentionDays { get; init; }
+    public int? PerformanceRetentionDays { get; init; }
 
     /// <summary>Retention for monitor state-change history; bounds get_scom_state_changes.</summary>
-    public int StateChangeRetentionDays { get; init; }
+    public int? StateChangeRetentionDays { get; init; }
 
     /// <summary>True when any list below was cut at the row cap.</summary>
     public bool Truncated { get; init; }

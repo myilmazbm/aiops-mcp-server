@@ -371,22 +371,38 @@ public static class ScomTools
         var lists = new[] { "ManagementServers", "Agents", "GreyAgents", "InMaintenanceMode", "ComputersWithoutAgent" };
         var truncated = lists.Any(name => PsValue.GetMany(row, name).Count() > MonitoringHealthMaxRows);
 
+        // A read the SCOM role refused is reported, never rendered as a zero: "0 agents,
+        // retention 0 days, every computer without an agent" with status ok is exactly what
+        // this tool returned for a Read-Only Operator before the wrapper named its refusals.
+        var unavailable = PsValue.GetMany(row, "Unavailable")
+            .Select(o => o.BaseObject as string).Where(s => !string.IsNullOrWhiteSpace(s)).Select(s => s!).ToList();
+        var status = call.Status.ToWire();
+        var error = call.Error;
+        if (unavailable.Count > 0 && call.Status == ServerCallStatus.Ok)
+        {
+            status = "partial";
+            error = "Not readable with the service account's SCOM role (needs SCOM Administrator): " +
+                    string.Join(", ", unavailable) +
+                    ". The affected settings are null and agents/management servers carry name and health only.";
+        }
+
         return new GetScomMonitoringHealthResult
         {
-            Status = call.Status.ToWire(),
-            Error = call.Error,
+            Status = status,
+            Error = error,
+            Unavailable = unavailable,
             Truncated = truncated,
             ManagementGroup = PsValue.Get<string>(row, "ManagementGroup"),
             ManagementGroupVersion = PsValue.Get<string>(row, "ManagementGroupVersion"),
             IsConnected = PsValue.Get<bool>(row, "IsConnected"),
             AgentCount = PsValue.Get<int>(row, "AgentCount"),
             GreyAgentCount = PsValue.Get<int>(row, "GreyAgentCount"),
-            PendingAgentCount = PsValue.Get<int>(row, "PendingAgentCount"),
-            NotificationSubscriptionCount = PsValue.Get<int>(row, "NotificationSubscriptionCount"),
-            HeartbeatIntervalSeconds = PsValue.Get<int>(row, "HeartbeatIntervalSeconds"),
-            MissingHeartbeatThreshold = PsValue.Get<int>(row, "MissingHeartbeatThreshold"),
-            PerformanceRetentionDays = PsValue.Get<int>(row, "PerformanceRetentionDays"),
-            StateChangeRetentionDays = PsValue.Get<int>(row, "StateChangeRetentionDays"),
+            PendingAgentCount = PsValue.Get<int?>(row, "PendingAgentCount"),
+            NotificationSubscriptionCount = PsValue.Get<int?>(row, "NotificationSubscriptionCount"),
+            HeartbeatIntervalSeconds = PsValue.Get<int?>(row, "HeartbeatIntervalSeconds"),
+            MissingHeartbeatThreshold = PsValue.Get<int?>(row, "MissingHeartbeatThreshold"),
+            PerformanceRetentionDays = PsValue.Get<int?>(row, "PerformanceRetentionDays"),
+            StateChangeRetentionDays = PsValue.Get<int?>(row, "StateChangeRetentionDays"),
             ManagementServers = ParseDelimited(row, "ManagementServers", f => new ScomManagementServerDto
             {
                 Name = f[0],
